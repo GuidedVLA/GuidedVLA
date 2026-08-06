@@ -942,10 +942,10 @@ def build_model(
     if not resuming and getattr(train_model_config, "control_attention_enabled", False):
         model.enable_control_attention(**control_attention_kwargs)
 
+    # Respect the explicit training configuration.  Memory policy must be
+    # reproducible from the config/launcher and must not change implicitly
+    # when the number of DDP ranks changes.
     enable_gc = getattr(config, "use_gradient_checkpointing", False)
-    if not enable_gc and world_size >= 4:
-        logging.info(f"Auto-enabling gradient checkpointing for world_size={world_size}.")
-        enable_gc = True
     if hasattr(model, "gradient_checkpointing_enable"):
         if enable_gc:
             model.gradient_checkpointing_enable()
@@ -1120,9 +1120,17 @@ def train_loop(
 
     world_size = torch.distributed.get_world_size() if use_ddp else 1
     per_device_batch_size = config.batch_size // world_size
+    if config.gradient_accumulation_steps < 1:
+        raise ValueError(
+            "gradient_accumulation_steps must be at least 1, "
+            f"got {config.gradient_accumulation_steps}"
+        )
+    effective_global_batch_size = config.batch_size * config.gradient_accumulation_steps
     logging.info(
         f"Using batch size per GPU: {per_device_batch_size} "
-        f"(global batch size across {world_size} GPUs: {config.batch_size})"
+        f"(physical global batch size across {world_size} GPUs: {config.batch_size}, "
+        f"gradient accumulation: {config.gradient_accumulation_steps}, "
+        f"effective global batch size: {effective_global_batch_size})"
     )
 
     train_loader, val_loader, data_config = build_data_loaders(config)
@@ -1208,7 +1216,10 @@ def train_loop(
         )
         logging.info(
             "Training config: "
-            f"batch_size={config.batch_size}, per_gpu_batch_size={per_device_batch_size}, "
+            f"physical_global_batch_size={config.batch_size}, "
+            f"per_gpu_batch_size={per_device_batch_size}, "
+            f"gradient_accumulation_steps={config.gradient_accumulation_steps}, "
+            f"effective_global_batch_size={effective_global_batch_size}, "
             f"num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
@@ -1292,7 +1303,13 @@ def train_loop(
             logging.info(f"Compile warmup completed in {time.time() - warmup_start:.2f}s")
             logging.info("All GPUs synchronized and ready for training")
 
-    def run_training_step(observation, actions, object_target_batch, current_step):
+    def run_training_microbatch(
+        observation,
+        actions,
+        object_target_batch,
+        current_step,
+        accumulation_index,
+    ):
         object_targets = prepare_object_targets(
             object_target_batch,
             device,
@@ -1304,26 +1321,46 @@ def train_loop(
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
 
-        main_loss, object_loss, skill_loss = compute_batch_losses(
-            model,
-            observation,
-            actions,
-            object_targets=object_targets,
-            use_object_loss=use_object_loss,
-            use_skill_loss=use_skill_loss,
+        completes_optimizer_step = accumulation_index == config.gradient_accumulation_steps - 1
+        sync_context = (
+            contextlib.nullcontext()
+            if not use_ddp or completes_optimizer_step
+            else model.no_sync()
         )
+        with sync_context:
+            main_loss, object_loss, skill_loss = compute_batch_losses(
+                model,
+                observation,
+                actions,
+                object_targets=object_targets,
+                use_object_loss=use_object_loss,
+                use_skill_loss=use_skill_loss,
+            )
 
-        total_loss = main_loss + object_loss_weight * object_loss + skill_loss_weight * skill_loss
-        total_loss.backward()
+            total_loss = main_loss + object_loss_weight * object_loss + skill_loss_weight * skill_loss
+            (total_loss / config.gradient_accumulation_steps).backward()
 
-        if current_step < _EARLY_MEMORY_LOG_STEPS and is_main and torch.cuda.is_available():
-            log_memory_usage(device, current_step, "after_backward")
+        grad_norm = None
+        if completes_optimizer_step:
+            if current_step < _EARLY_MEMORY_LOG_STEPS and is_main and torch.cuda.is_available():
+                log_memory_usage(device, current_step, "after_backward")
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=config.optimizer.clip_gradient_norm,
+            )
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        return current_lr, total_loss, main_loss, object_loss, skill_loss, grad_norm
+        return (
+            current_lr,
+            total_loss,
+            main_loss,
+            object_loss,
+            skill_loss,
+            grad_norm,
+            completes_optimizer_step,
+        )
 
     def log_training_metrics(current_step, current_lr, interval_start_time):
         elapsed = time.time() - interval_start_time
@@ -1421,6 +1458,13 @@ def train_loop(
     val_max_batches = config.val_max_batches
 
     prefetcher = DevicePrefetcher(train_loader, device)
+    accumulation_index = 0
+    accumulated_total_loss = torch.zeros(1, device=device)
+    accumulated_main_loss = torch.zeros(1, device=device)
+    accumulated_object_loss = torch.zeros(1, device=device)
+    accumulated_skill_loss = torch.zeros(1, device=device)
+    accumulated_data_time = 0.0
+    accumulated_compute_time = 0.0
 
     while global_step < config.num_train_steps:
         if use_ddp and hasattr(train_loader, "set_epoch"):
@@ -1435,27 +1479,58 @@ def train_loop(
             if global_step >= config.num_train_steps:
                 break
 
-            current_lr, total_loss, main_loss, object_loss, skill_loss, grad_norm = run_training_step(
+            (
+                current_lr,
+                total_loss,
+                main_loss,
+                object_loss,
+                skill_loss,
+                grad_norm,
+                completes_optimizer_step,
+            ) = run_training_microbatch(
                 observation,
                 actions,
                 object_target_batch,
                 global_step,
+                accumulation_index,
             )
 
             batch_compute_time = time.time() - compute_start
+            accumulated_total_loss += total_loss.detach()
+            accumulated_main_loss += main_loss.detach()
+            accumulated_object_loss += object_loss.detach()
+            if use_skill_loss:
+                accumulated_skill_loss += skill_loss.detach()
+            accumulated_data_time += batch_data_time
+            accumulated_compute_time += batch_compute_time
+            accumulation_index += 1
+
+            if not completes_optimizer_step:
+                data_start = time.time()
+                continue
+
             if is_main:
-                running_total_loss += total_loss.detach()
-                running_main_loss += main_loss.detach()
-                running_object_loss += object_loss.detach()
+                accumulation_scale = 1.0 / config.gradient_accumulation_steps
+                running_total_loss += accumulated_total_loss * accumulation_scale
+                running_main_loss += accumulated_main_loss * accumulation_scale
+                running_object_loss += accumulated_object_loss * accumulation_scale
                 if use_skill_loss:
-                    running_skill_loss += skill_loss.detach()
+                    running_skill_loss += accumulated_skill_loss * accumulation_scale
                 if isinstance(grad_norm, torch.Tensor):
                     running_grad_norm += grad_norm.detach()
                 else:
                     running_grad_norm += grad_norm
-                running_data_time += batch_data_time
-                running_compute_time += batch_compute_time
+                running_data_time += accumulated_data_time
+                running_compute_time += accumulated_compute_time
                 steps_since_log += 1
+
+            accumulation_index = 0
+            accumulated_total_loss.zero_()
+            accumulated_main_loss.zero_()
+            accumulated_object_loss.zero_()
+            accumulated_skill_loss.zero_()
+            accumulated_data_time = 0.0
+            accumulated_compute_time = 0.0
 
             global_step += 1
             save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
