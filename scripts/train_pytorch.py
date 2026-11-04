@@ -623,7 +623,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     if not optimizer_path.exists():
         raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
 
-    optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
+    optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=True)
     logging.info("Loaded optimizer state from pt format")
     optimizer.load_state_dict(optimizer_state_dict)
     del optimizer_state_dict
